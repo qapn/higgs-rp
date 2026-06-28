@@ -84,15 +84,19 @@ def build_body(inp):
     if inp.get("voice"):
         body["voice"] = inp["voice"]
 
-    for key in ("temperature", "top_p"):
+    for key in ("temperature", "top_p", "min_p", "repetition_penalty"):
         if inp.get(key) is not None:
             body[key] = float(inp[key])
     for key in ("top_k", "max_new_tokens"):
         if inp.get(key) is not None:
             body[key] = int(inp[key])
     seed = inp.get("seed")
-    if seed is not None and int(seed) != 0:
+    if seed is not None:
         body["seed"] = int(seed)
+
+    extra = inp.get("params")
+    if isinstance(extra, dict):
+        body.update(extra)
 
     return body, response_format
 
@@ -115,8 +119,19 @@ def handler(job):
         ref_text = inp.get("ref_text") or inp.get("reference_text")
         if ref_b64:
             os.makedirs(REF_DIR, exist_ok=True)
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", dir=REF_DIR, delete=False)
-            tmp.write(base64.b64decode(ref_b64))
+            raw = base64.b64decode(ref_b64)
+            if raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+                suffix = ".wav"
+            elif raw[:4] == b"fLaC":
+                suffix = ".flac"
+            elif raw[:4] == b"OggS":
+                suffix = ".ogg"
+            elif raw[:3] == b"ID3" or (len(raw) >= 2 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0):
+                suffix = ".mp3"
+            else:
+                suffix = ".wav"
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, dir=REF_DIR, delete=False)
+            tmp.write(raw)
             tmp.close()
             ref_path = tmp.name
             reference = {"audio_path": ref_path}
@@ -137,12 +152,19 @@ def handler(job):
         out_fd.close()
         out_path = out_fd.name
 
-        audio_url = upload_to_r2(job["id"], out_path, response_format)
-        return {
-            "audio_url": audio_url,
+        result = {
             "format": response_format,
             "sample_rate": SAMPLE_RATE,
         }
+        if inp.get("return_base64") is not False:
+            result["audio_base64"] = base64.b64encode(resp.content).decode()
+        bucket_vars = ("BUCKET_ENDPOINT_URL", "BUCKET_ACCESS_KEY_ID", "BUCKET_SECRET_ACCESS_KEY", "BUCKET_NAME")
+        if all(os.environ.get(v) for v in bucket_vars) and inp.get("return_url") is not False:
+            try:
+                result["audio_url"] = upload_to_r2(job["id"], out_path, response_format)
+            except Exception:
+                pass
+        return result
 
     except ValueError as e:
         return {"error": str(e)}
